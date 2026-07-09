@@ -249,6 +249,18 @@ if sys.platform != "win32":
     except ImportError:
         pass  # uvloop not available, use default event loop
 
+# Vendored-live fork marker: the trading bot's external monkeypatches check this
+# set and skip any fix that is already in-tree here (double-patch guard).
+VENDORED_FIXES: frozenset[str] = frozenset(
+    {
+        "coalesce",
+        "bounded_stats",
+        "position_additive_fields",
+        "orderbook_guards",
+        "disconnect_reorder",
+    }
+)
+
 __all__ = [
     # Data Models
     "Account",
@@ -314,6 +326,8 @@ __all__ = [
     # Version info
     "__author__",
     "__version__",
+    # Vendored-live fork marker (double-patch guard for downstream external patches)
+    "VENDORED_FIXES",
     # Order Templates
     "ATRStopTemplate",
     "BreakoutTemplate",
