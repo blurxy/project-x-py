@@ -112,7 +112,7 @@ See Also:
     - `types`: Type definitions and protocols
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Union
 
 __all__ = [
@@ -453,6 +453,31 @@ class Position:
             return (self.averagePrice - current_price) * self.size * tick_value
         else:
             return 0.0
+
+
+# ── Tolerate additive ProjectX Gateway fields on Position (ports projectx_position_patch) ──
+# The Gateway returns ``contractDisplayName`` (and, over time, other additive fields) in
+# position payloads. ``Position`` is a plain dataclass, so ``Position(**payload)`` would
+# raise ``TypeError: unexpected keyword argument`` — which silently strips the broker-side
+# stop-loss from every futures entry, because ``add_stop_loss`` / ``list_positions``
+# construct ``Position(**payload)`` and that construction dies on the unknown kwarg. Wrap
+# the dataclass-generated ``__init__`` to set aside ANY kwarg the dataclass does not declare,
+# build the instance from the known kwargs, then attach the extras as plain attributes (so
+# ``position.contractDisplayName`` — and ``position["contractDisplayName"]`` via __getitem__
+# — still read). Robust form endorsed by upstream PR #88 ("filter unknown fields"): this
+# hardens against the NEXT additive Gateway field too, not just today's.
+_position_generated_init = Position.__init__
+_position_known_fields = frozenset(f.name for f in fields(Position))
+
+
+def _position_tolerant_init(self: Position, *args: object, **kwargs: object) -> None:
+    extras = {k: kwargs.pop(k) for k in list(kwargs) if k not in _position_known_fields}
+    _position_generated_init(self, *args, **kwargs)  # type: ignore[arg-type]
+    for key, value in extras.items():
+        object.__setattr__(self, key, value)
+
+
+Position.__init__ = _position_tolerant_init  # type: ignore[method-assign]
 
 
 @dataclass
