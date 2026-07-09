@@ -90,6 +90,8 @@ See Also:
 
 import asyncio
 import logging
+import os
+import time
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -107,6 +109,24 @@ if TYPE_CHECKING:
     from project_x_py.utils.lock_optimization import AsyncRWLock
 
 logger = logging.getLogger(__name__)
+
+# ── Per-tick write coalescing (ports trading-bot projectx_coalesce_patch) ──
+# The SDK issues ONE Polars ``with_columns()`` per trade tick per timeframe to update
+# the in-progress bar. Under the RTH-open tick flood (e.g. 5 timeframes x 4 instruments)
+# this produces hundreds of thousands of Polars calls/sec on the asyncio event-loop
+# thread, saturating it and freezing the trading cycle. Coalesce same-bar updates:
+# accumulate high/low/close/volume in O(1) scalars and write to the frame at most once
+# per ``_COALESCE_S``. Closed bars stay byte-exact (pending is flushed into the closing
+# bar before a new bar is appended). Set ``PROJECTX_COALESCE_MS=0`` to disable entirely
+# and fall back to the exact per-tick SDK path.
+_COALESCE_MS = int(os.environ.get("PROJECTX_COALESCE_MS", "200"))
+_COALESCE_S = (_COALESCE_MS / 1000.0) if _COALESCE_MS > 0 else 0.0
+
+# Canonical 6-col realtime OHLCV schema. The ProjectX Gateway began adding columns
+# (d, k) to bar payloads; get_bars seeds them into historical frames while realtime
+# new-bars are built 6-col, so a concat raises "unable to append width N with width 6"
+# and stalls the bar. Coerce cached frames back to these 6 cols before any concat.
+_CANONICAL_RT_COLS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
 class DataProcessingMixin:
@@ -651,7 +671,187 @@ class DataProcessingMixin:
         volume: int,
     ) -> dict[str, Any] | None:
         """
-        Update a specific timeframe with new tick data.
+        Update a specific timeframe with new tick data (coalesced hot path).
+
+        Same-bar tick updates are coalesced: high/low/close/volume are accumulated in
+        O(1) scalars and written to the in-progress bar at most once per ``_COALESCE_S``
+        (leading-edge — the first tick after a flush writes through immediately, so a
+        lone tick is never deferred). New-bar / first-bar / DST-skip cases (and the exact
+        per-tick path when ``PROJECTX_COALESCE_MS=0``) delegate UNCHANGED to
+        :meth:`_append_or_update_bar`; any pending accumulation is flushed into the
+        closing bar first, so CLOSED bars are always byte-exact. This bounds the Polars
+        ``with_columns`` call rate off the asyncio event loop during the RTH-open tick
+        flood (ports the trading-bot ``projectx_coalesce_patch``).
+
+        Args:
+            tf_key: Timeframe key (e.g., "5min", "15min", "1hr")
+            timestamp: Timestamp of the tick
+            price: Price of the tick
+            volume: Volume of the tick
+
+        Returns:
+            dict: New bar event data if a new bar was created, None otherwise
+        """
+        try:
+            interval = self.timeframes[tf_key]["interval"]
+            unit = self.timeframes[tf_key]["unit"]
+
+            # Bar time via the same DST-aware helpers the impl uses (no reimplementation).
+            if hasattr(self, "handle_dst_bar_time"):
+                bar_time = self.handle_dst_bar_time(timestamp, interval, unit)
+                if bar_time is None:
+                    # DST skip: defer to the impl (preserves its logging + None return).
+                    return await self._append_or_update_bar(
+                        tf_key, timestamp, price, volume
+                    )
+            else:
+                bar_time = self._calculate_bar_time(timestamp, interval, unit)
+
+            if tf_key not in self.data:
+                return None
+
+            current_data = self.data[tf_key]
+            last_bar_time = self.last_bar_times.get(tf_key)
+            same_bar = (
+                _COALESCE_S > 0.0
+                and last_bar_time is not None
+                and bar_time == last_bar_time
+                and current_data.height > 0
+            )
+
+            if not hasattr(self, "_coalesce_pending"):
+                self._coalesce_pending = {}
+
+            if not same_bar:
+                # New bar / first bar / out-of-order / coalescing disabled: flush any
+                # pending accumulation into the still-open bar, drop stale pending state,
+                # coerce width drift, then run the UNCHANGED append/update logic.
+                if self._coalesce_pending.get(tf_key, {}).get("dirty"):
+                    await self._coalesce_flush(tf_key)
+                self._coalesce_pending.pop(tf_key, None)
+                self._coerce_canonical_schema(tf_key)
+                return await self._append_or_update_bar(
+                    tf_key, timestamp, price, volume
+                )
+
+            # --- same-bar: O(1) accumulate, throttled (leading-edge) write ---
+            aligned_price = align_price_to_tick(price, self.tick_size)
+            pend = self._coalesce_pending.get(tf_key)
+            if pend is None or pend["bar_time"] != bar_time:
+                pend = {
+                    "bar_time": bar_time,
+                    "high": aligned_price,
+                    "low": aligned_price,
+                    "close": aligned_price,
+                    "vol": int(volume),
+                    "dirty": True,
+                    # 0.0 => the first tick of a fresh bar flushes immediately.
+                    "last_flush": 0.0,
+                }
+                self._coalesce_pending[tf_key] = pend
+            else:
+                if aligned_price > pend["high"]:
+                    pend["high"] = aligned_price
+                if aligned_price < pend["low"]:
+                    pend["low"] = aligned_price
+                pend["close"] = aligned_price
+                pend["vol"] += int(volume)
+                pend["dirty"] = True
+
+            if time.monotonic() - pend["last_flush"] >= _COALESCE_S:
+                await self._coalesce_flush(tf_key)
+            return None
+
+        except Exception as e:
+            # Fail-safe: never let coalescing break the feed — fall back to the exact path.
+            self.logger.error(f"Error coalescing {tf_key} timeframe: {e}")
+            return await self._append_or_update_bar(tf_key, timestamp, price, volume)
+
+    async def _coalesce_flush(self, tf_key: str) -> None:
+        """Write the coalesced O(1) accumulation for ``tf_key`` to the in-progress bar
+        with ONE ``with_columns`` call. Math is identical to the same-bar branch of
+        :meth:`_append_or_update_bar` (aligned max-high / min-low / last-close /
+        summed-volume), so the resulting bar is byte-exact."""
+        pend = getattr(self, "_coalesce_pending", {}).get(tf_key)
+        if not pend or not pend.get("dirty"):
+            return
+        current_data = self.data.get(tf_key)
+        if current_data is None or current_data.height == 0:
+            return
+        last_row_mask = pl.col("timestamp") == pl.lit(pend["bar_time"])
+        last_row = current_data.filter(last_row_mask)
+        if last_row.height == 0:
+            # Pending bar already rolled off (no longer the tracked row) — drop it.
+            return
+        current_high = last_row.select(pl.col("high")).item()
+        current_low = last_row.select(pl.col("low")).item()
+        current_volume = last_row.select(pl.col("volume")).item()
+        new_high = align_price_to_tick(max(current_high, pend["high"]), self.tick_size)
+        new_low = align_price_to_tick(min(current_low, pend["low"]), self.tick_size)
+        new_volume = current_volume + pend["vol"]
+        self.data[tf_key] = current_data.with_columns(
+            [
+                pl.when(last_row_mask)
+                .then(pl.lit(new_high))
+                .otherwise(pl.col("high"))
+                .alias("high"),
+                pl.when(last_row_mask)
+                .then(pl.lit(new_low))
+                .otherwise(pl.col("low"))
+                .alias("low"),
+                pl.when(last_row_mask)
+                .then(pl.lit(pend["close"]))
+                .otherwise(pl.col("close"))
+                .alias("close"),
+                pl.when(last_row_mask)
+                .then(pl.lit(new_volume))
+                .otherwise(pl.col("volume"))
+                .alias("volume"),
+            ]
+        )
+        # Volume delta consumed; high/low/close remain the bar's running values.
+        pend["vol"] = 0
+        pend["dirty"] = False
+        pend["last_flush"] = time.monotonic()
+        if hasattr(self, "track_bar_updated"):
+            await self.track_bar_updated(tf_key)
+
+    def _coerce_canonical_schema(self, tf_key: str) -> None:
+        """Coerce a cached timeframe frame back to the canonical 6-col realtime schema.
+        The ProjectX Gateway began adding columns (d, k) to bar payloads; get_bars seeds
+        them into historical frames while realtime new-bars are built 6-col, so a concat
+        raises "unable to append width N with width 6", stalling the bar and flooding
+        logs. The SDK realtime path reads/writes only these 6 columns, so dropping the
+        extras is safe (ports the trading-bot projectx_coalesce_patch width-drift guard)."""
+        try:
+            current_data = self.data.get(tf_key)
+            if (
+                current_data is not None
+                and current_data.width != 6
+                and all(c in current_data.columns for c in _CANONICAL_RT_COLS)
+            ):
+                dropped = [
+                    c for c in current_data.columns if c not in _CANONICAL_RT_COLS
+                ]
+                self.data[tf_key] = current_data.select(_CANONICAL_RT_COLS)
+                self.logger.warning(
+                    f"Coerced {tf_key} frame {current_data.width}->6 cols "
+                    f"(dropped {dropped}) to fix realtime width-drift append error"
+                )
+        except Exception as e:
+            self.logger.debug(f"width-drift coercion for {tf_key} non-fatal: {e!r}")
+
+    async def _append_or_update_bar(
+        self,
+        tf_key: str,
+        timestamp: datetime,
+        price: float,
+        volume: int,
+    ) -> dict[str, Any] | None:
+        """
+        Append a new bar or update the in-progress bar with a single tick — the exact,
+        un-coalesced SDK logic. Delegated to by :meth:`_update_timeframe_data` for
+        new-bar / first-bar / DST-skip cases and whenever coalescing is disabled.
 
         Args:
             tf_key: Timeframe key (e.g., "5min", "15min", "1hr")

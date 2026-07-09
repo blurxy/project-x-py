@@ -1246,6 +1246,14 @@ class RealtimeDataManager(
         ensuring bars are still created at the proper intervals.
         """
         try:
+            # Width-drift guard (ports projectx_coalesce_patch): coerce every cached
+            # frame back to the canonical 6-col realtime schema before the empty-bar
+            # concat below, so a Gateway-widened historical seed cannot raise "unable to
+            # append width N with width 6" during quiet low-volume periods (overnight).
+            # Synchronous (no await) => atomic w.r.t. tick processing on the event loop.
+            for _tf in list(getattr(self, "data", {}) or {}):
+                self._coerce_canonical_schema(_tf)
+
             current_time = datetime.now(self.timezone)
             events_to_trigger = []
 
