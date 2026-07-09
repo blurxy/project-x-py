@@ -56,6 +56,19 @@ import logging
 from project_x_py.orderbook.base import OrderBookBase
 from project_x_py.types import DomType
 
+# ── Hot-path recent_trades bound (ports trading-bot projectx_orderbook_patch Patch B) ──
+# ``_process_trade`` rebuilds ``recent_trades`` with a ``pl.concat`` on EVERY trade. Left
+# unbounded, that frame grows without limit between the periodic memory-manager cleanups
+# (default ``max_trades=10000`` every 300s), so the concat copies an ever-larger frame and
+# the RTH-open trade burst becomes O(n^2), saturating the asyncio event loop (root-caused a
+# 09:30 run-loop hang). Trim to ``_RECENT_TRADES_KEEP`` once the frame exceeds
+# ``_RECENT_TRADES_CAP`` so the NEXT concat stays bounded and cheap. This is intentionally a
+# TIGHT hot-path bound (far below ``max_trades``): real-time order-flow analytics need only
+# the most recent few hundred trades, while the periodic cleanup still governs deeper
+# retention/memory.
+_RECENT_TRADES_CAP = 800
+_RECENT_TRADES_KEEP = 500
+
 
 class RealtimeHandler:
     """
@@ -396,6 +409,12 @@ class RealtimeHandler:
             This method should only be called from within _process_market_depth
             while the orderbook lock is already held.
         """
+        # Patch A (ports projectx_orderbook_patch): the practice/sim L2 feed emits None
+        # depth entries. The code below immediately calls entry.get(...), which would raise
+        # "'NoneType' object has no attribute 'get'" (logged ~95k times/session, burying
+        # every real event). Skip None entries cleanly.
+        if entry is None:
+            return None
         try:
             trade_type = entry.get("type", 0)
             price = float(entry.get("price", 0))
@@ -551,6 +570,14 @@ class RealtimeHandler:
             [self.orderbook.recent_trades, new_trade],
             how="vertical",
         )
+
+        # Patch B (ports projectx_orderbook_patch): bound recent_trades so the NEXT concat
+        # stays O(<=_RECENT_TRADES_CAP) instead of growing unbounded between periodic memory
+        # cleanups -> keeps the event loop free during the RTH-open trade burst.
+        if self.orderbook.recent_trades.height > _RECENT_TRADES_CAP:
+            self.orderbook.recent_trades = self.orderbook.recent_trades.tail(
+                _RECENT_TRADES_KEEP
+            )
 
         # Trigger trade callback
         await self.orderbook._trigger_callbacks(
