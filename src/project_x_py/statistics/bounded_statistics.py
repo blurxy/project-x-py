@@ -910,17 +910,24 @@ class BoundedStatisticsMixin:
 
     async def cleanup_bounded_statistics(self) -> None:
         """
-        Manually trigger cleanup of all bounded statistics.
+        Stop the bounded-statistics background scheduler at disconnect/shutdown.
 
-        This method can be called to force immediate cleanup, typically
-        during component shutdown or when memory pressure is detected.
+        NOTE: This intentionally does NOT run ``_cleanup_counters()``. That sweep takes
+        ``_counter_lock`` and calls ``get_statistics()`` across every bounded counter — a
+        read sweep over shared structures that, at DISCONNECT, races the still-live
+        SignalR tick threads mid-mutation of those same structures and corrupts the native
+        heap on Windows (STATUS_HEAP_CORRUPTION / 0xc0000374; see issue #98 and the
+        trading-bot ``projectx_bounded_stats_patch``). The sweep's only job is to trim
+        expired data, which is pointless here — the counters are torn down with the context
+        and GC'd. Periodic in-session cleanup is UNAFFECTED: the ``CleanupScheduler`` loop
+        calls ``_cleanup_counters()`` directly, not through this method, so memory bounding
+        during a live session still runs. ``_cleanup_timing_buffers()`` / ``_cleanup_gauges()``
+        are already no-ops (circular buffers auto-cleanup via ``maxlen``). Only the
+        scheduler stop is required here.
         """
         try:
-            await self._cleanup_counters()
-            await self._cleanup_timing_buffers()
-            await self._cleanup_gauges()
-
-            # Stop the cleanup scheduler
+            # Stop the cleanup scheduler (cancels the background task). The racing
+            # disconnect-time counter sweep is deliberately omitted — see the docstring.
             await self._cleanup_scheduler.stop()
 
             self.logger.info("Bounded statistics cleanup completed")
