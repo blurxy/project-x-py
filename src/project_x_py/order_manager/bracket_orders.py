@@ -480,30 +480,50 @@ class BracketOrderMixin:
                         target_ref.size = size
 
                 elif not is_fully_filled and filled_size == 0:
-                    # Undefined state - recheck once
+                    # Undefined state: the fill wait returned (event fired or timed
+                    # out) but the order-status endpoint still reports 0 filled — a
+                    # known LAG between the fill and status propagation. The original
+                    # SINGLE 1s recheck abandoned too early: the fill lands a few
+                    # seconds later, the entry is REAL, and because we raise here the
+                    # protective stop/target legs never attach -> a NAKED filled
+                    # position (observed live in trading_bot #114, 2026-07-14: a MES
+                    # entry filled, this raised 'failed to fill after recheck', and the
+                    # position ran unprotected). Poll the status a BOUNDED number of
+                    # times before abandoning so a lagging-but-real fill still gets its
+                    # bracket; only genuinely-unfilled orders (still 0 after the whole
+                    # window) are cancelled and raised.
+                    recheck_attempts = 6
+                    recheck_interval = 1.0
                     logger.warning(
-                        f"Entry order {entry_order_id} in undefined state. Rechecking..."
+                        f"Entry order {entry_order_id} in undefined state. Polling fill "
+                        f"status up to {recheck_attempts}x{recheck_interval:g}s before abandoning..."
                     )
-                    await asyncio.sleep(1)
-
-                    (
-                        is_fully_filled,
-                        filled_size,
-                        remaining_size,
-                    ) = await self._check_order_fill_status(entry_order_id)
+                    for _ in range(recheck_attempts):
+                        await asyncio.sleep(recheck_interval)
+                        (
+                            is_fully_filled,
+                            filled_size,
+                            remaining_size,
+                        ) = await self._check_order_fill_status(entry_order_id)
+                        if filled_size > 0:
+                            break
 
                     if filled_size == 0:
-                        # Still unfilled, cancel and abort
+                        # Still unfilled after the full poll window — genuinely no
+                        # fill; cancel and abort (the safe original behavior).
                         try:
                             await self.cancel_order(entry_order_id, account_id)
                         except Exception as cancel_error:
                             logger.error(f"Failed to cancel order: {cancel_error}")
 
                         raise ProjectXOrderError(
-                            f"Entry order {entry_order_id} failed to fill after recheck."
+                            f"Entry order {entry_order_id} failed to fill after "
+                            f"{recheck_attempts} rechecks."
                         )
                     else:
-                        # Actually partially filled
+                        # Filled (fully or partially) during the poll — size the
+                        # protective orders to the actual filled quantity so the
+                        # bracket attaches to what really filled.
                         size = filled_size
                         if stop_ref:
                             stop_ref.size = size
