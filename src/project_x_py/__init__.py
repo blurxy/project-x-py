@@ -258,6 +258,9 @@ VENDORED_FIXES: frozenset[str] = frozenset(
         "position_additive_fields",
         "orderbook_guards",
         "disconnect_reorder",
+        # BOT-400: crossed/locked-book trades classified by the tick rule and counted in
+        # trade_flow_stats["crossed_book_trades"] (orderbook/realtime.py _process_trade).
+        "crossed_book_tick_rule",
     }
 )
 
