@@ -112,6 +112,10 @@ class RealtimeHandler:
         self.is_connected = False
         self.subscribed_contracts: set[str] = set()
 
+        # Tick-rule state for trades classified on a crossed or locked book (BOT-400)
+        self._last_trade_price: float | None = None
+        self._last_tick_side: str | None = None
+
     async def initialize(
         self,
         realtime_client: "ProjectXRealtimeClient",
@@ -483,6 +487,10 @@ class RealtimeHandler:
         - Buy trade: Price >= best ask (aggressive buyer)
         - Sell trade: Price <= best bid (aggressive seller)
         - Neutral trade: Price between bid and ask (cannot determine aggressor)
+        - Crossed or locked book (best ask <= best bid, stale levels the feed never
+          deleted): tick rule against the previous print; a zero tick repeats the last
+          tick's side; with no previous print the side is unknown. Counted in
+          trade_flow_stats["crossed_book_trades"].
 
         The method also updates:
         - Recent trades DataFrame with full trade details
@@ -502,19 +510,39 @@ class RealtimeHandler:
             This method assumes the orderbook lock is already held by the caller.
         """
         # Determine trade side based on price relative to spread
+        stats = self.orderbook.trade_flow_stats
+        prev_price = self._last_trade_price
         side = "unknown"
-        if pre_bid is not None and pre_ask is not None:
-            _mid_price = (pre_bid + pre_ask) / 2
+        crossed = pre_bid is not None and pre_ask is not None and pre_ask <= pre_bid
+        if pre_bid is not None and pre_ask is not None and not crossed:
             if price >= pre_ask:
                 side = "buy"
-                self.orderbook.trade_flow_stats["aggressive_buy_volume"] += volume
+                stats["aggressive_buy_volume"] += volume
             elif price <= pre_bid:
                 side = "sell"
-                self.orderbook.trade_flow_stats["aggressive_sell_volume"] += volume
+                stats["aggressive_sell_volume"] += volume
             else:
                 # Trade inside spread - likely market maker
                 side = "neutral"
-                self.orderbook.trade_flow_stats["market_maker_trades"] += 1
+                stats["market_maker_trades"] += 1
+        elif crossed:
+            # BOT-400: with best ask <= best bid the quote test reads every print as a
+            # buy (price >= ask is tested first), so cumulative delta could only rise.
+            stats["crossed_book_trades"] = stats.get("crossed_book_trades", 0) + 1
+            if prev_price is not None and price > prev_price:
+                side = "buy"
+            elif prev_price is not None and price < prev_price:
+                side = "sell"
+            else:
+                side = self._last_tick_side or "unknown"
+            if side == "buy":
+                stats["aggressive_buy_volume"] += volume
+            elif side == "sell":
+                stats["aggressive_sell_volume"] += volume
+
+        if prev_price is not None and price != prev_price:
+            self._last_tick_side = "buy" if price > prev_price else "sell"
+        self._last_trade_price = price
 
         # Calculate spread at trade time
         spread_at_trade = None
