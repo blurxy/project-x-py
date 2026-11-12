@@ -130,35 +130,8 @@ class AuthenticationMixin:
         buffer_time = timedelta(minutes=5)
         return datetime.datetime.now(pytz.UTC) >= (self.token_expiry - buffer_time)
 
-    @handle_errors("authenticate")
-    async def authenticate(self: "ProjectXClientProtocol") -> None:
-        """
-        Authenticate with ProjectX API and select account.
-
-        This method handles the complete authentication flow:
-        1. Authenticates with username and API key
-        2. Retrieves available accounts
-        3. Selects the specified account or first available
-
-        The authentication token is automatically refreshed when needed
-        during API calls.
-
-        Raises:
-            ProjectXAuthenticationError: If authentication fails
-            ValueError: If specified account is not found
-
-        Example:
-            >>> # V3: Async authentication with error handling
-            >>> async with ProjectX.from_env() as client:
-            >>>     try:
-            >>>         await client.authenticate()
-            >>>         account = client.account_info  # Access account info after auth
-            >>>         print(f"Authenticated account: {account.name}")
-            >>>         print(f"Account ID: {account.id}")
-            >>>         print(f"Balance: ${account.balance:,.2f}")
-            >>>     except ProjectXAuthenticationError as e:
-            >>>         print(f"Authentication failed: {e}")
-        """
+    async def _login_token(self: "ProjectXClientProtocol") -> None:
+        """Log in and store a fresh session token, without selecting an account."""
         logger.debug(LogMessages.AUTH_START, extra={"username": self.username})
 
         # Authenticate and get token
@@ -191,6 +164,37 @@ class AuthenticationMixin:
             logger.warning(LogMessages.AUTH_TOKEN_PARSE_FAILED, extra={"error": str(e)})
             # Set a default expiry of 1 hour
             self.token_expiry = datetime.datetime.now(pytz.UTC) + timedelta(hours=1)
+
+    @handle_errors("authenticate")
+    async def authenticate(self: "ProjectXClientProtocol") -> None:
+        """
+        Authenticate with ProjectX API and select account.
+
+        This method handles the complete authentication flow:
+        1. Authenticates with username and API key
+        2. Retrieves available accounts
+        3. Selects the specified account or first available
+
+        The authentication token is automatically refreshed when needed
+        during API calls.
+
+        Raises:
+            ProjectXAuthenticationError: If authentication fails
+            ValueError: If specified account is not found
+
+        Example:
+            >>> # V3: Async authentication with error handling
+            >>> async with ProjectX.from_env() as client:
+            >>>     try:
+            >>>         await client.authenticate()
+            >>>         account = client.account_info  # Access account info after auth
+            >>>         print(f"Authenticated account: {account.name}")
+            >>>         print(f"Account ID: {account.id}")
+            >>>         print(f"Balance: ${account.balance:,.2f}")
+            >>>     except ProjectXAuthenticationError as e:
+            >>>         print(f"Authentication failed: {e}")
+        """
+        await self._login_token()
 
         # Get accounts using the same endpoint as sync client
         payload = {"onlyActiveAccounts": True}
@@ -301,3 +305,51 @@ class AuthenticationMixin:
 
         accounts_data = response.get("accounts", [])
         return [Account(**acc) for acc in accounts_data]
+
+    @handle_errors("switch account")
+    async def switch_account(
+        self: "ProjectXClientProtocol", account_id: int
+    ) -> Account:
+        """
+        Re-bind this session to another account on the same login, in place.
+
+        No new login is made unless the token is due for refresh. Raises the same
+        account-not-found error as authenticate() and changes nothing when
+        `account_id` is not listed. Afterwards authenticate() and every refresh
+        path re-select the new account by name.
+
+        Args:
+            account_id: The id of an account listed by list_accounts().
+
+        Returns:
+            The newly selected Account.
+        """
+        # A due refresh via list_accounts() would re-select by the OLD name and
+        # raise if the broker already delisted it: refresh the token alone.
+        if self._authenticated and self._should_refresh_token():
+            await self._login_token()
+
+        accounts = await self.list_accounts()
+        selected = next((acc for acc in accounts if acc.id == account_id), None)
+        if selected is None:
+            available = ", ".join(f"{acc.name} ({acc.id})" for acc in accounts)
+            raise ValueError(
+                format_error_message(
+                    ErrorMessages.ACCOUNT_NOT_FOUND,
+                    account_name=str(account_id),
+                    available_accounts=available,
+                )
+            )
+
+        previous = self.account_info
+        self.account_info = selected
+        self.account_name = selected.name
+        logger.info(
+            "Switched account in place",
+            extra={
+                "from_account_id": previous.id if previous else None,
+                "account_id": selected.id,
+                "account_name": selected.name,
+            },
+        )
+        return selected

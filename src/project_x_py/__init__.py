@@ -261,6 +261,8 @@ VENDORED_FIXES: frozenset[str] = frozenset(
         # BOT-400: crossed/locked-book trades classified by the tick rule and counted in
         # trade_flow_stats["crossed_book_trades"] (orderbook/realtime.py _process_trade).
         "crossed_book_tick_rule",
+        # In-place account re-bind on the same session: ProjectX / realtime / TradingSuite.switch_account.
+        "account_switch",
     }
 )
 

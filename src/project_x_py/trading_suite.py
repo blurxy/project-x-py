@@ -51,7 +51,7 @@ import yaml
 from project_x_py.client import ProjectX
 from project_x_py.client.base import ProjectXBase
 from project_x_py.event_bus import EventBus, EventType
-from project_x_py.models import Instrument
+from project_x_py.models import Account, Instrument
 from project_x_py.order_manager import OrderManager
 from project_x_py.order_tracker import OrderChainBuilder, OrderTracker
 from project_x_py.orderbook import OrderBook
@@ -970,6 +970,51 @@ class TradingSuite:
         """
         if not self._connected:
             await self._initialize()
+
+    async def switch_account(self, account_id: int) -> Account:
+        """
+        Re-bind the whole suite to another account on the same session, in place.
+
+        Order: client (account_info / account_name), then the realtime user hub,
+        then every instrument's order and position tracking is cleared of the
+        old account's state. Any failure raises; a raise means the switch is
+        incomplete and the caller must not trade on this suite.
+
+        Args:
+            account_id: The id of an account listed on the current login.
+
+        Returns:
+            The newly selected Account.
+        """
+        acct = await self.client.switch_account(account_id)
+        # Realtime first, so late old-account events cannot refill the caches cleared below.
+        await self.realtime.switch_account(acct.id)
+
+        if self._instruments:
+            managers = [(c.orders, c.positions) for c in self._instruments.values()]
+        else:
+            managers = [
+                (getattr(self, "_orders", None), getattr(self, "_positions", None))
+            ]
+        for orders, positions in managers:
+            if orders is not None:
+                async with orders.order_lock:
+                    orders.clear_order_tracking()
+                    orders.oco_pairs.clear()  # clear_order_tracking() misses it
+            if positions is not None:
+                async with positions.position_lock:
+                    positions.tracked_positions.clear()
+                    positions.position_history.clear()
+                    queue = positions._position_update_queue
+                    while not queue.empty():
+                        queue.get_nowait()
+                        queue.task_done()
+
+        logger.info(
+            f"TradingSuite switched to account {acct.name} ({acct.id}); "
+            f"cleared order/position tracking for {len(managers)} instrument(s)"
+        )
+        return acct
 
     async def disconnect(self) -> None:
         """

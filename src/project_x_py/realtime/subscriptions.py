@@ -65,6 +65,7 @@ See Also:
 import asyncio
 from typing import TYPE_CHECKING
 
+from project_x_py.exceptions import ProjectXConnectionError
 from project_x_py.utils import (
     LogContext,
     LogMessages,
@@ -407,6 +408,42 @@ class SubscriptionsMixin:
                 extra={"status": "success", "channel": "user_updates"},
             )
             return True
+
+    async def switch_account(
+        self: "ProjectXRealtimeClientProtocol", account_id: int | str
+    ) -> None:
+        """
+        Move the user-hub subscription to another account on the same session.
+
+        Connected: unsubscribe the old id (a refusal, e.g. for a deleted account,
+        is logged and skipped), set the new id, subscribe it; raises
+        ProjectXConnectionError if that subscribe fails. Not connected: only the
+        id changes, so the next subscribe uses it.
+        """
+        old_id = self.account_id
+        if not self.user_connected:
+            self.account_id = str(account_id)
+            logger.info(
+                "Realtime account switched (hub not connected)",
+                extra={"from_account_id": old_id, "account_id": self.account_id},
+            )
+            return
+
+        if not await self.unsubscribe_user_updates():
+            logger.warning(
+                "Unsubscribe of the old account failed; continuing the switch",
+                extra={"account_id": old_id},
+            )
+        self.account_id = str(account_id)
+        if not await self.subscribe_user_updates():
+            raise ProjectXConnectionError(
+                f"User-hub subscribe failed for account {self.account_id} "
+                f"after switching from {old_id}"
+            )
+        logger.info(
+            "Realtime account switched",
+            extra={"from_account_id": old_id, "account_id": self.account_id},
+        )
 
     @handle_errors("unsubscribe market data", reraise=False, default_return=False)
     async def unsubscribe_market_data(
